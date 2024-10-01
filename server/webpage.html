@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>File Upload and Client Management</title>
+    <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+    <h1>File Upload and Client Management</h1>
+
+    <h2>Send Message</h2>
+    <form id="message-form">
+        <input type="text" id="message-input" placeholder="Enter your message">
+        <button type="submit">Send</button>
+    </form>
+
+    <h2>Select Client Options</h2>
+    <div id="client-options"></div>
+
+    <h2>Upload File</h2>
+    <form id="upload-form">
+        <input type="file" id="file-input">
+        <button type="submit" id="upload-button" disabled>Upload</button>
+        <button type="button" id="pause-button" disabled>Pause</button>
+    </form>
+
+    <script>
+        const socket = io('http://localhost:3000');
+        const clients = ['client1', 'client2', 'client3'];
+        let onlineClients = {};
+        let uploadInProgress = false;
+        let uploadPaused = false;
+        let currentUpload = null;
+        let isSendingChunk = false;  // New flag to prevent duplicate sending
+
+
+        const clientOptionsContainer = document.getElementById('client-options');
+        const uploadButton = document.getElementById('upload-button');
+        const pauseButton = document.getElementById('pause-button');
+        const fileInput = document.getElementById('file-input');
+
+        // Socket connection setup
+        socket.on('connect', () => {
+            console.log('Connected to server');
+            socket.emit('identify', 'master');
+        });
+
+        socket.on('bulk_status', (statusUpdates) => {
+            statusUpdates.forEach(update => {
+                onlineClients[update.clientId] = update.status;
+            });
+            updateClientOptions();
+        });
+
+        function createClientElement(clientId) {
+            const clientContainer = document.createElement('div');
+            clientContainer.id = `container-${clientId}`;
+            clientContainer.innerHTML = `
+                <input type="checkbox" id="${clientId}">
+                <label for="${clientId}">${clientId}</label><br>
+                <progress id="progress-${clientId}" value="0" max="100"></progress><br>
+                <div id="messages-${clientId}"></div>
+                
+                <hr>
+            `;
+            return clientContainer;
+        }
+
+        function updateClientOptions() {
+            clients.forEach(clientId => {
+                let clientContainer = document.getElementById(`container-${clientId}`);
+                if (!clientContainer) {
+                    clientContainer = createClientElement(clientId);
+                    clientOptionsContainer.appendChild(clientContainer);
+                }
+
+                const checkbox = clientContainer.querySelector(`#${clientId}`);
+                const label = clientContainer.querySelector(`label[for="${clientId}"]`);
+
+                checkbox.disabled = !onlineClients[clientId];
+                label.textContent = `${clientId} (${onlineClients[clientId] ? 'Online' : 'Offline'})`;
+            });
+
+            updateUploadButton();
+        }
+
+        function updateUploadButton() {
+            const anyClientSelected = Array.from(document.querySelectorAll('input[type="checkbox"]'))
+                .some(checkbox => checkbox.checked && !checkbox.disabled);
+            uploadButton.disabled = !anyClientSelected || uploadInProgress;
+            pauseButton.disabled = !uploadInProgress;
+        }
+
+        function getSelectedClients() {
+            return Array.from(document.querySelectorAll('input[type="checkbox"]'))
+                .filter(checkbox => checkbox.checked && !checkbox.disabled)
+                .map(checkbox => checkbox.id);
+        }
+
+        function sendMessage(event){  event.preventDefault(); // Prevent the form from submitting the traditional way
+
+        // Get the message from the input field
+        const message = document.getElementById('message-input').value;
+
+        // Get the selected clients (assuming this is a multi-select element)
+        const selectedClients = getSelectedClients();
+
+        // Ensure a message and at least one client is selected
+        if (message && selectedClients.length > 0) {
+            // Send the message and selected clients to the server using Socket.IO
+            socket.emit('send-message', { message: message, clients: selectedClients });
+
+            // Clear the message input after sending
+            document.getElementById('message-input').value = '';
+        } else {
+            alert('Please enter a message and select at least one client.');
+        }
+        };
+
+        function uploadFile(event) {
+            event.preventDefault();
+            const file = fileInput.files[0];
+            if (file) {
+                uploadInProgress = true;
+                uploadPaused = false;
+                updateUploadButton();
+
+                const selectedClients = getSelectedClients();
+                const chunkSize = 64 * 1024;  // Set chunk size (64KB)
+                currentUpload = { file, selectedClients, chunkSize, offset: 0, chunkSequence: 0 };
+                sendChunk();  // Start sending chunks
+            }
+        }
+
+        function pauseUpload() {
+    if (uploadInProgress) {
+        uploadPaused = true;
+        socket.emit('pause_upload');  // Notify server to pause
+        console.log('Upload paused');
+       
+        updateProgressBars();
+        const userChoice = confirm("Upload paused. Do you want to continue?");
+        userChoice ? resumeUpload() : cancelUpload();
+    }
+}
+
+function resumeUpload() {
+    if (uploadPaused) {
+        uploadPaused = false;
+        socket.emit('resume_upload');  // Notify server to resume
+        console.log('Upload resumed at chunk sequence ' + currentUpload.chunkSequence);  // Log the chunk sequence
+
+        // Continue sending chunks from the last sequence without resetting the chunkSequence
+        sendChunk();  
+    }   
+}
+
+function sendChunk() {
+    if (uploadPaused || !currentUpload || isSendingChunk) return;  // Stop if paused, canceled, or already sending
+
+    isSendingChunk = true;
+
+    const { file, selectedClients, chunkSize, offset, chunkSequence } = currentUpload;
+    console.log('Sending chunk sequence:', chunkSequence);  // Log the current chunk sequence
+
+    const chunk = file.slice(offset, offset + chunkSize);
+    const reader = new FileReader();
+
+    reader.onload = function(e) {
+        if (!currentUpload) {
+            isSendingChunk = false;  // Reset flag if upload is canceled
+            return;
+        }
+        const chunkData = new Uint8Array(e.target.result);
+        const isFinalChunk = offset + chunkSize >= file.size;
+
+        // Send chunk to selected clients
+        selectedClients.forEach(clientId => {
+            socket.emit('file_chunk', {
+                targetClientId: clientId,
+                chunkData,
+                chunkSequence,  // Ensure correct sequence is sent
+                isFinalChunk,
+                fileName: file.name
+            });
+        });
+
+        // Update the chunk sequence and offset for the next chunk
+        currentUpload.offset += chunkSize;
+        currentUpload.chunkSequence++;  // Increment chunk sequence correctly
+        console.log('next chunk sequence:', currentUpload.chunkSequence); 
+        updateProgressBars();
+
+        isSendingChunk = false;
+
+
+        if (currentUpload.offset < file.size) {
+            requestAnimationFrame(sendChunk);  // Send the next chunk
+        } else {
+            uploadComplete();  // Finish upload
+        }
+    };
+
+    reader.readAsArrayBuffer(chunk);  // Read chunk as ArrayBuffer
+}
+
+        function updateProgressBars() {
+            const { file, selectedClients, offset } = currentUpload;
+            const progress = Math.min(100, Math.round((offset / file.size) * 100));
+
+            selectedClients.forEach(clientId => {
+                const progressBar = document.getElementById(`progress-${clientId}`);
+                if (progressBar) progressBar.value = progress;
+            });
+        }
+
+        function uploadComplete() {
+            uploadInProgress = false;
+            currentUpload = null;
+            updateUploadButton();
+            alert("File uploaded successfully!");
+            resetProgressBars();
+        }
+
+        function resetProgressBars() {
+            document.querySelectorAll('progress').forEach(bar => bar.value = 0);
+        }
+
+        function cancelUpload() {
+            //uploadPaused = false;
+            if (currentUpload) {
+                const { file, selectedClients } = currentUpload;
+                selectedClients.forEach(clientId => {
+                    socket.emit('cancel_upload', { targetClientId: clientId, fileName: file.name })
+                });
+            }
+            uploadInProgress = false;
+            uploadPaused = false;
+            currentUpload = null;
+            fileInput.value = '';
+            updateUploadButton();
+            resetProgressBars();
+            alert("Upload cancelled and partial file removed.");
+        }
+
+        clientOptionsContainer.addEventListener('change', updateUploadButton);
+        fileInput.addEventListener('change', updateUploadButton);
+       document.getElementById('message-form').addEventListener('submit', sendMessage);
+        document.getElementById('upload-form').addEventListener('submit', uploadFile);
+        pauseButton.addEventListener('click', pauseUpload);
+
+        // Initial setup
+        updateClientOptions();
+    </script>
+</body>
+</html>
